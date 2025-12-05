@@ -3,53 +3,28 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>实时手势骨架映射</title>
+    <title>高密度粒子体积手势仿真</title>
     <style>
-        body { margin: 0; overflow: hidden; background-color: #000; font-family: 'Segoe UI', sans-serif; }
+        body { margin: 0; overflow: hidden; background-color: #000; }
         canvas { display: block; }
-        
-        /* 摄像头预览 (调试用，可隐藏) */
-        #webcam { position: absolute; bottom: 0; left: 0; width: 150px; opacity: 0.5; pointer-events: none; z-index: 0; transform: scaleX(-1); /* 镜像预览 */ }
-
-        /* UI 面板 */
-        #ui-container {
-            position: absolute;
-            bottom: 30px;
-            right: 30px;
-            background: rgba(255, 255, 255, 0.1);
-            backdrop-filter: blur(10px);
-            padding: 15px;
-            border-radius: 20px;
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            display: flex;
-            gap: 10px;
-            align-items: center;
-            z-index: 10;
-        }
-
-        /* 颜色选择器自定义 */
-        input[type="color"] {
-            -webkit-appearance: none; border: none; width: 40px; height: 40px; border-radius: 50%; background: none; cursor: pointer;
-        }
-        input[type="color"]::-webkit-color-swatch-wrapper { padding: 0; }
-        input[type="color"]::-webkit-color-swatch { border: 2px solid rgba(255,255,255,0.5); border-radius: 50%; }
-
+        /* 摄像头预览镜像并置底 */
+        #webcam { position: absolute; bottom: 10px; left: 10px; width: 160px; transform: scaleX(-1); opacity: 0.3; z-index: 2; border-radius: 8px; border: 1px solid #333; }
         #status {
             position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
-            color: white; font-size: 24px; text-align: center; pointer-events: none; text-shadow: 0 0 10px black;
-            transition: opacity 0.5s;
+            color: #00d2ff; font-family: monospace; font-size: 20px; text-align: center;
+            pointer-events: none; text-shadow: 0 0 15px #00d2ff; z-index: 10;
+        }
+        #info {
+            position: absolute; top: 10px; left: 10px; color: rgba(255,255,255,0.6);
+            font-family: monospace; font-size: 12px; pointer-events: none;
         }
     </style>
 </head>
 <body>
 
-    <div id="status">正在加载 AI 模型...<br>请允许摄像头权限并举起手</div>
+    <div id="status">正在初始化 AI 与 25万 粒子系统...<br>这可能需要几秒钟</div>
+    <div id="info">粒子数: 250,000 | 模式: 体积仿真</div>
     <video id="webcam" autoplay playsinline></video>
-
-    <div id="ui-container">
-        <span style="color:white; font-size: 14px;">调整颜色:</span>
-        <input type="color" id="colorPicker" value="#00ff88">
-    </div>
 
     <script type="importmap">
         {
@@ -66,80 +41,100 @@
         import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
         import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
 
-        // --- 1. Three.js 初始化 ---
-        const scene = new THREE.Scene();
-        // 不需要迷雾了，清晰一点更好看
-        // scene.fog = new THREE.FogExp2(0x000000, 0.02);
-        
-        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-        // 相机离近一点
-        camera.position.z = 20;
-        camera.position.y = 2;
+        // --- 配置项 ---
+        // 核心调整：为了性能与效果的平衡，使用约 25 万个粒子。
+        // 1600万在浏览器中不可行。25万已足够产生高密度的体积感。
+        const PARTICLE_COUNT = 20 * 1000; 
+        const HAND_SCALE = 20.0; // 缩放 MediaPipe 的数据到 Three.js 场景
 
-        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        // --- 1. Three.js 场景初始化 ---
+        const scene = new THREE.Scene();
+        // 稍微加一点迷雾增加深邃感
+        scene.fog = new THREE.FogExp2(0x000000, 0.015);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 2, 25);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
         renderer.setSize(window.innerWidth, window.innerHeight);
-        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // 限制像素比以提高性能
         document.body.appendChild(renderer.domElement);
 
         const controls = new OrbitControls(camera, renderer.domElement);
         controls.enableDamping = true;
-        // 关闭自动旋转，方便观察手势
-        controls.autoRotate = false; 
+        controls.autoRotate = false;
+        controls.target.set(0,0,0);
 
-        // --- 2. 粒子与骨架系统定义 ---
-        // MediaPipe 手部有 21 个关键点
-        const particleCount = 21;
+        // --- 2. 高密度粒子系统构建 ---
+
+        // 定义手部骨骼连接关系 (用于在骨骼间分布粒子)
+        // 格式: [起点索引, 终点索引, 该段的粗细权重]
+        const bones = [
+            [0, 1, 1.2], [1, 2, 1.0], [2, 3, 0.9], [3, 4, 0.8], // 拇指
+            [0, 5, 1.1], [5, 6, 0.95], [6, 7, 0.85], [7, 8, 0.75], // 食指
+            [0, 9, 1.1], [9, 10, 0.95], [10, 11, 0.85], [11, 12, 0.75], // 中指
+            [0, 13, 1.0], [13, 14, 0.9], [14, 15, 0.8], [15, 16, 0.7], // 无名指
+            [0, 17, 0.9], [17, 18, 0.8], [18, 19, 0.7], [19, 20, 0.6], // 小指
+            // 手掌内部连接，增加手掌厚度感
+            [5, 9, 1.3], [9, 13, 1.3], [13, 17, 1.2], [1, 5, 1.4], [1, 17, 1.4]
+        ];
+
         const geometry = new THREE.BufferGeometry();
-        const positions = new Float32Array(particleCount * 3);
-        
-        // 初始化位置在屏幕外
-        for (let i = 0; i < particleCount * 3; i++) positions[i] = 9999;
+        const positions = new Float32Array(PARTICLE_COUNT * 3);
+        // 用于存储每个粒子的元数据，以便在动画循环中知道它属于哪根骨头以及相对位置
+        const particleMetadata = new Float32Array(PARTICLE_COUNT * 4); // [boneIndex, t(0-1位置), radialOffset, angleOffset]
+
+        // 初始化粒子数据
+        let pIndex = 0;
+        let mIndex = 0;
+        for (let i = 0; i < PARTICLE_COUNT; i++) {
+            // 随机分配给一个骨骼段
+            const boneIdx = Math.floor(Math.random() * bones.length);
+            const boneData = bones[boneIdx];
+            
+            // 在骨骼段上的线性位置 (0 = 起点, 1 = 终点)
+            // 使用 power 让粒子稍微向关节两端聚集，看起来更自然
+            const t = Math.pow(Math.random(), 1.2); 
+
+            // 径向散布，模拟手指粗细
+            // 基础半径 * 骨骼粗细权重 * 随机分布 * 两头细中间粗的效果
+            const thicknessProfile = 1.0 - Math.pow(2 * t - 1, 4); // 两头细中间粗的曲线
+            const maxRadius = 0.8 * boneData[2] * thicknessProfile;
+            // 使用 sqrt 保证圆形区域内的均匀分布
+            const radius = Math.sqrt(Math.random()) * maxRadius * (0.5 + 0.5 * Math.random()); 
+            const angle = Math.random() * Math.PI * 2;
+
+            // 存储元数据
+            particleMetadata[mIndex++] = boneIdx;
+            particleMetadata[mIndex++] = t;
+            particleMetadata[mIndex++] = radius;
+            particleMetadata[mIndex++] = angle;
+
+            // 初始位置先扔到屏幕外
+            positions[pIndex++] = 9999; positions[pIndex++] = 9999; positions[pIndex++] = 9999;
+        }
+
         geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
 
-        const baseColor = 0x00ff88;
-
-        // A. 关节粒子材质
-        const pointMaterial = new THREE.PointsMaterial({
-            size: 0.8, // 粒子大一点，看清关节
-            color: baseColor,
+        // 粒子材质：使用加法混合模式，让密集的粒子重叠处发光
+        const material = new THREE.PointsMaterial({
+            size: 0.12, // 粒子越小越细腻
+            color: 0x00d2ff, // 青蓝色科技感
             transparent: true,
-            opacity: 0.9,
+            opacity: 0.6,
             blending: THREE.AdditiveBlending,
-            depthTest: false // 确保始终在最前面
+            depthWrite: false, // 关闭深度写入，实现半透明叠加发光效果
+            // sizeAttenuation: true // 开启近大远小
         });
-        const particles = new THREE.Points(geometry, pointMaterial);
-        scene.add(particles);
 
-        // B. 骨架连线定义
-        // 定义手部关节连接关系 (索引对)
-        const connections = [
-            [0, 1], [1, 2], [2, 3], [3, 4], // 拇指
-            [0, 5], [5, 6], [6, 7], [7, 8], // 食指
-            [0, 9], [9, 10], [10, 11], [11, 12], // 中指
-            [0, 13], [13, 14], [14, 15], [15, 16], // 无名指
-            [0, 17], [17, 18], [18, 19], [19, 20], // 小指
-            [5, 9], [9, 13], [13, 17] // 手掌横向连接
-        ];
-        
-        const lineGeometry = new THREE.BufferGeometry();
-        const linePositions = new Float32Array(connections.length * 2 * 3); // 每个连接2个点，每个点3个坐标
-        lineGeometry.setAttribute('position', new THREE.BufferAttribute(linePositions, 3));
-        
-        const lineMaterial = new THREE.LineBasicMaterial({
-            color: baseColor,
-            transparent: true,
-            opacity: 0.4,
-            depthTest: false
-        });
-        const lines = new THREE.LineSegments(lineGeometry, lineMaterial);
-        scene.add(lines);
+        const particleSystem = new THREE.Points(geometry, material);
+        scene.add(particleSystem);
 
 
-        // --- 3. MediaPipe 手势识别 ---
+        // --- 3. MediaPipe 手势识别部分 (保持不变) ---
         let handLandmarker = undefined;
         const video = document.getElementById('webcam');
         const statusDiv = document.getElementById('status');
-        // 用于存储最新一帧检测到的 21 个点数据
         let latestLandmarks3D = null; 
 
         const createHandLandmarker = async () => {
@@ -152,15 +147,15 @@
                     delegate: "GPU"
                 },
                 runningMode: "VIDEO",
-                numHands: 1 // 只检测一只手
+                numHands: 1
             });
-            statusDiv.innerText = "模型加载完毕，请举手...";
+            statusDiv.innerHTML = "AI模型就绪。<br>请允许摄像头权限并举起手。";
             startWebcam();
         };
 
         const startWebcam = () => {
             if (!handLandmarker) return;
-            navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } }).then((stream) => {
+            navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480, frameRate: { ideal: 30 } } }).then((stream) => {
                 video.srcObject = stream;
                 video.addEventListener("loadeddata", predictWebcam);
             });
@@ -173,89 +168,104 @@
                 const startTimeMs = performance.now();
                 if (handLandmarker) {
                     const result = handLandmarker.detectForVideo(video, startTimeMs);
-                    
                     if (result.worldLandmarks && result.worldLandmarks.length > 0) {
-                        statusDiv.style.opacity = 0; // 检测到手后隐藏提示
-                        // 获取第一只手的世界坐标数据 (比归一化坐标更适合3D展示)
+                        statusDiv.style.opacity = 0;
                         latestLandmarks3D = result.worldLandmarks[0];
                     } else {
-                        latestLandmarks3D = null; // 未检测到手
+                        latestLandmarks3D = null;
                         statusDiv.style.opacity = 1;
                         statusDiv.innerText = "未检测到手势";
                     }
                 }
             }
-            window.requestAnimationFrame(predictWebcam);
+            // 使用 setTimeout 而不是 requestAnimationFrame 来控制检测频率，减轻 CPU 负担
+            setTimeout(predictWebcam, 30); 
         }
 
         createHandLandmarker();
 
-        // --- 4. 渲染循环与交互逻辑 ---
+        // --- 4. 核心动画循环 (高性能更新) ---
         
-        // 颜色选择器
-        document.getElementById('colorPicker').addEventListener('input', (e) => {
-            pointMaterial.color.set(e.target.value);
-            lineMaterial.color.set(e.target.value);
-        });
-
         window.addEventListener('resize', () => {
             camera.aspect = window.innerWidth / window.innerHeight;
             camera.updateProjectionMatrix();
             renderer.setSize(window.innerWidth, window.innerHeight);
         });
 
+        // 预分配临时向量以避免垃圾回收
+        const vStart = new THREE.Vector3();
+        const vEnd = new THREE.Vector3();
+        const vDir = new THREE.Vector3();
+        const vAxisU = new THREE.Vector3();
+        const vAxisV = new THREE.Vector3();
+        const tempPos = new THREE.Vector3();
+        const upWorld = new THREE.Vector3(0, 1, 0);
+
         function animate() {
             requestAnimationFrame(animate);
             controls.update();
 
             const currentPositions = geometry.attributes.position.array;
-            const currentLinePositions = lineGeometry.attributes.position.array;
 
             if (latestLandmarks3D) {
-                // A. 更新 21 个关节粒子的位置
-                for (let i = 0; i < particleCount; i++) {
-                    const landmark = latestLandmarks3D[i];
-                    const i3 = i * 3;
+                let pIdx = 0;
+                let mIdx = 0;
 
-                    // 坐标映射与缩放
-                    // MediaPipe worldLandmarks 单位大约是米。我们需要放大以适应 Three.js 场景。
-                    // x 取反以实现镜像效果
-                    const targetX = -landmark.x * 20; 
-                    const targetY = -landmark.y * 20; // Y轴反转，因为 MP Y轴向下
-                    const targetZ = -landmark.z * 20; 
+                // 遍历所有 25万 个粒子进行更新
+                for (let i = 0; i < PARTICLE_COUNT; i++) {
+                    // 读取元数据
+                    const boneIdx = particleMetadata[mIdx++];
+                    const t = particleMetadata[mIdx++];
+                    const radius = particleMetadata[mIdx++];
+                    const angle = particleMetadata[mIdx++];
 
-                    // 使用 Lerp 平滑移动 (0.3 的系数让跟随更紧密)
-                    currentPositions[i3] += (targetX - currentPositions[i3]) * 0.3;
-                    currentPositions[i3+1] += (targetY - currentPositions[i3+1]) * 0.3;
-                    currentPositions[i3+2] += (targetZ - currentPositions[i3+2]) * 0.3;
+                    const boneData = bones[boneIdx];
+                    const startLandmark = latestLandmarks3D[boneData[0]];
+                    const endLandmark = latestLandmarks3D[boneData[1]];
+
+                    // 1. 获取骨骼当前起点和终点的世界坐标 (应用缩放和镜像)
+                    vStart.set(-startLandmark.x * HAND_SCALE, -startLandmark.y * HAND_SCALE, -startLandmark.z * HAND_SCALE);
+                    vEnd.set(-endLandmark.x * HAND_SCALE, -endLandmark.y * HAND_SCALE, -endLandmark.z * HAND_SCALE);
+
+                    // 2. 计算骨骼上的基础线性位置 (Lerp)
+                    tempPos.lerpVectors(vStart, vEnd, t);
+
+                    // 3. 计算体积偏移 (难点：如何快速计算垂直于骨骼方向的偏移)
+                    // 计算骨骼方向向量
+                    vDir.subVectors(vEnd, vStart).normalize();
+
+                    // 构建一个局部坐标系 (U, V) 垂直于骨骼方向
+                    // 使用一个稍微偏离的向上向量来避免万向节死锁
+                    vAxisU.crossVectors(vDir, upWorld).normalize();
+                    // 如果方向接近垂直向上，叉乘结果可能是零向量，做一个后备处理
+                    if (vAxisU.lengthSq() < 0.001) {
+                         vAxisU.crossVectors(vDir, new THREE.Vector3(1, 0, 0)).normalize();
+                    }
+                    vAxisV.crossVectors(vAxisU, vDir).normalize();
+                    
+                    // 根据极坐标 (radius, angle) 计算偏移向量
+                    const offsetX = radius * Math.cos(angle);
+                    const offsetY = radius * Math.sin(angle);
+                    
+                    // 应用偏移：基础位置 + U轴分量 + V轴分量
+                    // 增加一些随机噪点让边缘更柔和
+                    const noise = 0.05 * (Math.random() - 0.5);
+
+                    currentPositions[pIdx++] = tempPos.x + vAxisU.x * offsetX + vAxisV.x * offsetY + noise;
+                    currentPositions[pIdx++] = tempPos.y + vAxisU.y * offsetX + vAxisV.y * offsetY + noise;
+                    currentPositions[pIdx++] = tempPos.z + vAxisU.z * offsetX + vAxisV.z * offsetY + noise;
                 }
-
-                // B. 更新骨架连线的位置 (基于已更新的粒子位置)
-                let lineIndex = 0;
-                for (let i = 0; i < connections.length; i++) {
-                    const startIdx = connections[i][0];
-                    const endIdx = connections[i][1];
-
-                    // 线条起点的坐标 = 对应粒子的坐标
-                    currentLinePositions[lineIndex++] = currentPositions[startIdx * 3];
-                    currentLinePositions[lineIndex++] = currentPositions[startIdx * 3 + 1];
-                    currentLinePositions[lineIndex++] = currentPositions[startIdx * 3 + 2];
-
-                    // 线条终点的坐标
-                    currentLinePositions[lineIndex++] = currentPositions[endIdx * 3];
-                    currentLinePositions[lineIndex++] = currentPositions[endIdx * 3 + 1];
-                    currentLinePositions[lineIndex++] = currentPositions[endIdx * 3 + 2];
-                }
+                
+                // 标记位置数据已更新，需要上传到 GPU
+                geometry.attributes.position.needsUpdate = true;
 
             } else {
-                // 如果手势丢失，让粒子缓慢散开或回到中心 (可选，这里暂时让它们停留在最后位置)
-                // 也可以取消注释下面这行，让它们缓慢消失到远方
-                // for(let i=0; i<currentPositions.length; i++) currentPositions[i] += (999 - currentPositions[i]) * 0.01;
+                // 手势丢失时，缓慢将所有粒子移出屏幕
+                // if (currentPositions[0] < 5000) {
+                //     for(let i=0; i < currentPositions.length; i++) currentPositions[i] += (9999 - currentPositions[i]) * 0.02;
+                //     geometry.attributes.position.needsUpdate = true;
+                // }
             }
-
-            // 通知 Three.js 更新顶点数据
-            geometry.attributes.position.needsUpdate = true;
-            lineGeometry.attributes.position.needsUpdate = true;
 
             renderer.render(scene, camera);
         }
